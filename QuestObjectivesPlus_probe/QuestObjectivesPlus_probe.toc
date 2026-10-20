@@ -1,0 +1,7 @@
+## Interface: 16001
+## Title: Quest Objectives+ probe
+## Notes: Dev-only. /qopprobe dumps tracker, party-progress and Edit Mode facts into a copyable window.
+## Author: Cyklades
+## Version: 0.1.0
+
+QuestObjectivesPlus_probe.lua

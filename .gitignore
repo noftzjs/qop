@@ -1,0 +1,2 @@
+# built tester zips live in dist/, the listing text is kept
+*.zip

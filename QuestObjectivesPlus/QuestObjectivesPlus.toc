@@ -1,0 +1,9 @@
+## Interface: 16001
+## Title: Quest Objectives+
+## Notes: Tidies the default quest tracker: finished quests in a collapsible section, party progress under each quest, drag and resize without Edit Mode.
+## Author: Cyklades
+## Version: 0.2.0
+## SavedVariables: QuestObjectivesPlusDB
+## IconTexture: Interface\Icons\INV_Misc_GroupLooking
+
+QuestObjectivesPlus.lua
