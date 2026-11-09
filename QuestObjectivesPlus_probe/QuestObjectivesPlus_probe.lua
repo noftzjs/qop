@@ -6,6 +6,15 @@
 	Before running: be in a party with at least one member who shares a quest
 	with you, track a few quests (some finished), and stand out of combat.
 	Run it again in combat and in a dungeon to see which values go secret.
+
+	Design checks for auto-share, the party audit and completed-quest search.
+	These write to a running log; /qopprobe report opens it.
+	/qopprobe share [now]     -> Q1: share without a click (next accepted quest, or now)
+	/qopprobe notheld [id]    -> Q2: party data for a quest you do not hold
+	/qopprobe access          -> Q3: one snapshot of party data and addon messages
+	/qopprobe watch           -> Q3: snapshot on every pull, boss and loading screen
+	/qopprobe completed [n]   -> Q4: completed IDs and how fast n names load (default 200)
+	/qopprobe report | clear  -> open or empty the running log
 ]]
 
 local lines = {}
@@ -435,7 +444,355 @@ end
 
 -------------------------------------------------------------------------------
 
+-- Design checks (9 Nov 2026)
+-------------------------------------------------------------------------------
+
+local trail = {}
+local PREFIX = "QOPP"
+local SHARE_WATCH_SECONDS = 20
+local WATCH_MIN_GAP = 10
+local NAME_BATCH, NAME_TICK, NAME_IDLE_TIMEOUT = 20, 0.25, 15
+
+local function note(fmt, ...)
+	local s = fmt
+	if select("#", ...) > 0 then
+		local ok, r = pcall(string.format, fmt, ...)
+		s = ok and r or (fmt .. " (format error: " .. tostring(r) .. ")")
+	end
+	trail[#trail + 1] = ("[%.1f] %s"):format(GetTime(), s)
+end
+
+local function say(fmt, ...)
+	note(fmt, ...)
+	print("|cff66ccffQOP probe:|r " .. trail[#trail])
+end
+
+local function context(label)
+	local inInstance, kind = IsInInstance()
+	local restricted = C_Secrets and C_Secrets.HasSecretRestrictions and C_Secrets.HasSecretRestrictions()
+	note("--- %s: combat=%s instance=%s/%s group=%s members=%s secretRestrictions=%s", label,
+		fmtv(InCombatLockdown()), fmtv(inInstance), fmtv(kind), fmtv(IsInGroup()), fmtv(GetNumGroupMembers()), fmtv(restricted))
+end
+
+local function titleOf(questID)
+	local ok, title = pcall(C_QuestLog.GetTitleForQuestID, questID)
+	return ok and fmtv(title) or "?"
+end
+
+-- quest IDs in the log, without the headers, at most `max`
+local function LogQuests(max)
+	local ids = {}
+	for i = 1, (C_QuestLog.GetNumQuestLogEntries() or 0) do
+		local ok, info = pcall(C_QuestLog.GetInfo, i)
+		if ok and type(info) == "table" and not info.isHeader and type(info.questID) == "number" then
+			ids[#ids + 1] = info.questID
+			if max and #ids >= max then break end
+		end
+	end
+	return ids
+end
+
+local function DumpPartyData(questID, verbose)
+	if not (C_TooltipInfo and C_TooltipInfo.GetQuestPartyProgress) then
+		note("GetQuestPartyProgress is missing")
+		return
+	end
+	local ok, data = pcall(C_TooltipInfo.GetQuestPartyProgress, questID, true, true)
+	if not ok then
+		note("quest %s %s: ERROR %s", tostring(questID), titleOf(questID), tostring(data))
+		return
+	end
+	if type(data) ~= "table" or type(data.lines) ~= "table" then
+		note("quest %s %s: no line data (%s)", tostring(questID), titleOf(questID), fmtv(data))
+		return
+	end
+	local secret = 0
+	for i, line in ipairs(data.lines) do
+		if not accessible(line.leftText) then secret = secret + 1 end
+		if verbose then
+			note("   line %d: type=%s left=%s completed=%s", i, fmtv(line.type), fmtv(line.leftText), fmtv(line.completed))
+		end
+	end
+	note("quest %s %s: %d lines, %d secret", tostring(questID), titleOf(questID), #data.lines, secret)
+end
+
+-- Q1: share from code, with no click anywhere in the call chain ---------------
+
+local shareArmed = false
+local shareWatchUntil = 0
+
+local function ListPushMessages()
+	local names = {}
+	for k, v in pairs(_G) do
+		if type(k) == "string" and k:find("^ERR_QUEST_PUSH") then
+			names[#names + 1] = k .. " = " .. fmtv(v)
+		end
+	end
+	table.sort(names)
+	note("%d ERR_QUEST_PUSH globals", #names)
+	for _, entry in ipairs(names) do note("   %s", entry) end
+end
+
+-- the same path the addon's Share button uses
+local function PushFromCode(questID)
+	context("share attempt")
+	note("quest %s %s pushable=%s", tostring(questID), titleOf(questID), fmtv(C_QuestLog.IsPushableQuest(questID)))
+	shareWatchUntil = GetTime() + SHARE_WATCH_SECONDS
+	local path, ok, err
+	if QuestUtil and type(QuestUtil.ShareQuest) == "function" then
+		path = "QuestUtil.ShareQuest"
+		ok, err = pcall(QuestUtil.ShareQuest, questID)
+	else
+		path = "SetSelectedQuest + QuestLogPushQuest"
+		pcall(C_QuestLog.SetSelectedQuest, questID)
+		ok, err = pcall(QuestLogPushQuest)
+	end
+	say("%s from code -> ok=%s err=%s. Did the party member get the offer? Replies are logged for %d s.",
+		path, tostring(ok), fmtv(err), SHARE_WATCH_SECONDS)
+end
+
+local function CmdShare(rest)
+	if not IsInGroup() then say("share: join a party first; the offer needs someone to reach"); return end
+	ListPushMessages()
+	if rest == "now" then
+		for _, id in ipairs(LogQuests()) do
+			if C_QuestLog.IsPushableQuest(id) and not C_QuestLog.IsComplete(id) then
+				say("share: sharing %s %s in 3 s from a timer", tostring(id), titleOf(id))
+				C_Timer.After(3, function() PushFromCode(id) end)
+				return
+			end
+		end
+		say("share: no shareable, unfinished quest in your log")
+		return
+	end
+	shareArmed = true
+	say("share: armed. Accept a shareable quest; it is shared 2 s later, once.")
+end
+
+-- Q2: party data for a quest you do not hold -----------------------------------
+
+local recentlyRemoved = {}
+
+local function CmdNotHeld(rest)
+	context("not-held check")
+	local control = LogQuests(1)[1]
+	if control then
+		note("control, a quest you hold:")
+		DumpPartyData(control, true)
+	end
+	local given = tonumber(rest)
+	local targets = given and { given } or recentlyRemoved
+	if #targets == 0 then
+		say("notheld: abandon a quest your party member still has, then run this again (or pass a quest ID)")
+		return
+	end
+	for _, id in ipairs(targets) do
+		note("not held: %s", tostring(id))
+		note("   still in my log = %s", fmtv(C_QuestLog.GetLogIndexForQuestID(id)))
+		DumpPartyData(id, true)
+	end
+	say("notheld: checked %d quest(s). The member's progress in the lines means the audit can see it without addon messages.", #targets)
+end
+
+-- Q3: what still works in combat and in instances -------------------------------
+
+local pingSeq = 0
+-- Marks our own messages when they echo back. Comparing the sender with
+-- UnitName failed on a First Last character name (ping answered itself).
+local SESSION_MARK = (":from=%05d"):format(math.random(0, 99999))
+
+local function GroupChannel()
+	if LE_PARTY_CATEGORY_INSTANCE and IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
+	if IsInGroup() then return "PARTY" end
+	return nil
+end
+
+local function Send(text)
+	local channel = GroupChannel()
+	if not channel then note("addon message not sent: not in a group"); return end
+	text = text .. SESSION_MARK
+	local ok, result = pcall(C_ChatInfo.SendAddonMessage, PREFIX, text, channel)
+	note("sent %d bytes on %s -> ok=%s result=%s", #text, channel, tostring(ok), fmtv(result))
+end
+
+local function SendPing()
+	pingSeq = pingSeq + 1
+	Send(("ping:%d:combat=%d:instance=%d"):format(pingSeq, InCombatLockdown() and 1 or 0, IsInInstance() and 1 or 0))
+end
+
+local function Snapshot(label, verbose)
+	context(label)
+	for _, id in ipairs(LogQuests(3)) do DumpPartyData(id, verbose) end
+	SendPing()
+end
+
+local function CmdAccess()
+	Snapshot("access check", true)
+	-- about the size of one packet of a quest-list message
+	Send("long:" .. string.rep("12345,", 39))
+	say("access: snapshot logged. A party member running the probe answers pings automatically.")
+end
+
+local watching = false
+local lastWatch = 0
+
+local function CmdWatch()
+	watching = not watching
+	say("watch: %s", watching and "on, a snapshot on every pull, boss and loading screen" or "off")
+end
+
+local function OnWatchTrigger(label)
+	if not watching or GetTime() - lastWatch < WATCH_MIN_GAP then return end
+	lastWatch = GetTime()
+	C_Timer.After(1, function() Snapshot(label, false) end)
+end
+
+local function OnAddonMessage(prefix, text, channel, sender)
+	if not accessible(prefix) then note("addon message with a secret prefix"); return end
+	if prefix ~= PREFIX then return end
+	local readable = accessible(text) and accessible(sender)
+	local mine = readable and text:find(SESSION_MARK, 1, true) ~= nil
+	local shown = readable and ("%d bytes %q"):format(#text, text:sub(1, 40)) or "<secret>"
+	context("addon message received")
+	-- how names arrive matters for the audit: First Last characters
+	note("names: sender=%s UnitName(player)=%s", fmtv(sender), fmtv(UnitName("player")))
+	if mine then
+		note("own echo on %s: %s", fmtv(channel), shown)
+		return
+	end
+	say("from %s on %s: %s", fmtv(sender), fmtv(channel), shown)
+	local seq = readable and text:match("^ping:(%d+)")
+	if seq then Send("pong:" .. seq) end
+end
+
+-- Q4: completed quests and loading their names ----------------------------------
+
+local nameLoad
+
+local function FinishNameLoad()
+	local run = nameLoad
+	nameLoad = nil
+	run.ticker:Cancel()
+	local elapsed = GetTime() - run.started
+	local titled, samples = 0, {}
+	for _, id in ipairs(run.sample) do
+		local title = C_QuestLog.GetTitleForQuestID(id)
+		if type(title) == "string" and accessible(title) and title ~= "" then
+			titled = titled + 1
+			if #samples < 15 then samples[#samples + 1] = ("%d=%s"):format(id, title) end
+		end
+	end
+	local rate = run.loaded > 0 and run.loaded / math.max(elapsed, 0.01) or 0
+	note("requested %d: loaded=%d failed=%d no reply=%d, titled afterwards=%d, in %.1f s",
+		#run.sample, run.loaded, run.failed, #run.sample - run.loaded - run.failed, titled, elapsed)
+	note("sample titles: %s", table.concat(samples, " | "))
+	say("completed: %.0f names per second; the %d unnamed quests would take about %.0f s",
+		rate, run.uncached, rate > 0 and run.uncached / rate or -1)
+end
+
+local function CmdCompleted(rest)
+	if nameLoad then say("completed: already running"); return end
+	context("completed quests")
+	local started = debugprofilestop()
+	local ids = C_QuestLog.GetAllCompletedQuestIDs()
+	note("GetAllCompletedQuestIDs -> %s ids in %.1f ms", type(ids) == "table" and #ids or fmtv(ids), debugprofilestop() - started)
+	if type(ids) ~= "table" then return end
+	local uncached = {}
+	started = debugprofilestop()
+	for _, id in ipairs(ids) do
+		local title = C_QuestLog.GetTitleForQuestID(id)
+		if not (type(title) == "string" and accessible(title) and title ~= "") then uncached[#uncached + 1] = id end
+	end
+	note("named already: %d, not loaded: %d (scan %.1f ms)", #ids - #uncached, #uncached, debugprofilestop() - started)
+	if #uncached == 0 then say("completed: every name is already loaded"); return end
+	-- spread across the list, so low and high IDs are both represented
+	local want = math.min(tonumber(rest) or 200, #uncached)
+	local sample, inSample, step = {}, {}, #uncached / want
+	for i = 1, want do
+		local id = uncached[math.floor((i - 1) * step) + 1]
+		sample[#sample + 1] = id
+		inSample[id] = true
+	end
+	local nextIndex = 1
+	nameLoad = { sample = sample, inSample = inSample, loaded = 0, failed = 0, uncached = #uncached, started = GetTime(), lastReply = GetTime() }
+	nameLoad.ticker = C_Timer.NewTicker(NAME_TICK, function()
+		for _ = 1, NAME_BATCH do
+			if nextIndex > #sample then break end
+			pcall(C_QuestLog.RequestLoadQuestByID, sample[nextIndex])
+			nextIndex = nextIndex + 1
+		end
+		local replied = nameLoad.loaded + nameLoad.failed
+		if replied >= #sample or (nextIndex > #sample and GetTime() - nameLoad.lastReply > NAME_IDLE_TIMEOUT) then
+			FinishNameLoad()
+		end
+	end)
+	say("completed: %d ids, %d without a name; loading %d now", #ids, #uncached, want)
+end
+
+local DESIGN_COMMANDS = {
+	share = CmdShare,
+	notheld = CmdNotHeld,
+	access = CmdAccess,
+	watch = CmdWatch,
+	completed = CmdCompleted,
+	report = function()
+		ShowWindow(#trail > 0 and table.concat(trail, "\n") or "The log is empty.")
+	end,
+	clear = function()
+		wipe(trail)
+		print("|cff66ccffQOP probe:|r log cleared")
+	end,
+}
+
+local checks = CreateFrame("Frame")
+for _, event in ipairs({
+	"QUEST_ACCEPTED", "QUEST_REMOVED", "QUEST_DATA_LOAD_RESULT", "CHAT_MSG_SYSTEM", "CHAT_MSG_ADDON",
+	"ADDON_ACTION_BLOCKED", "ADDON_ACTION_FORBIDDEN", "PLAYER_REGEN_DISABLED", "ENCOUNTER_START", "PLAYER_ENTERING_WORLD",
+}) do
+	checks:RegisterEvent(event)
+end
+if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
+	C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
+end
+
+checks:SetScript("OnEvent", function(_, event, a, b, c, d)
+	if event == "QUEST_ACCEPTED" then
+		local questID = type(b) == "number" and b or a
+		if shareArmed and type(questID) == "number" then
+			shareArmed = false
+			note("QUEST_ACCEPTED args: %s, %s", fmtv(a), fmtv(b))
+			C_Timer.After(2, function() PushFromCode(questID) end)
+		end
+	elseif event == "QUEST_REMOVED" then
+		if type(a) == "number" then
+			table.insert(recentlyRemoved, 1, a)
+			recentlyRemoved[6] = nil
+		end
+	elseif event == "QUEST_DATA_LOAD_RESULT" then
+		if nameLoad and nameLoad.inSample[a] then
+			nameLoad.inSample[a] = nil
+			nameLoad.lastReply = GetTime()
+			if b then nameLoad.loaded = nameLoad.loaded + 1 else nameLoad.failed = nameLoad.failed + 1 end
+		end
+	elseif event == "CHAT_MSG_SYSTEM" then
+		if GetTime() < shareWatchUntil then note("system message: %s", fmtv(a)) end
+	elseif event == "CHAT_MSG_ADDON" then
+		OnAddonMessage(a, b, c, d)
+	elseif event == "ADDON_ACTION_BLOCKED" or event == "ADDON_ACTION_FORBIDDEN" then
+		if GetTime() < shareWatchUntil then say("%s: %s tried %s", event, fmtv(a), fmtv(b)) end
+	else
+		OnWatchTrigger(event)
+	end
+end)
+
+-------------------------------------------------------------------------------
+
 local function Run(arg)
+	local command, rest = arg:match("^(%S+)%s*(.*)$")
+	if command and DESIGN_COMMANDS[command] then
+		DESIGN_COMMANDS[command](rest)
+		return
+	end
 	lines = {}
 	toChat = (arg == "chat")
 	ProbeBuild()

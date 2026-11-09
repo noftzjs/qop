@@ -1,5 +1,12 @@
 # Quest Objectives+ backlog
 
+## Inbox
+- [ ] Update the Profession section to behave like the other sections: clicking its header expands and collapses it. *(idea 2026-11-09)*
+- [ ] Update Quest Objectives+ with more useful features: Wowhead links for some quests, searching old/completed quests, maybe a robust audit that checks you and your party's quests are all synced; adjust font size and look into window adjustment bugs. *(idea 2026-11-09)*
+- [ ] Auto share quests you pick up with party members. *(idea 2026-11-09)*
+- [ ] Info box for quests that are part of a chain, which can be expanded to show the list of quests in that chain. *(idea 2026-11-09)*
+
+
 ## Done
 
 - [x] Research: no existing Forever addon enhances the default tracker; party counts available via C_TooltipInfo.GetQuestPartyProgress (17 Oct 2026)

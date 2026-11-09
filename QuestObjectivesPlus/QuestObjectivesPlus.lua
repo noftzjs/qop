@@ -1468,10 +1468,21 @@ local function RawMethod(name)
 	return mt and mt.__index and mt.__index[name]
 end
 
+-- BreakFromFrameManager makes Blizzard re-lay out RightManagedFrameContainer,
+-- whose SetSize is protected in combat: pcall does not stop the
+-- ADDON_ACTION_BLOCKED report. Edit Mode's ApplySystemAnchor can fire mid-fight
+-- and our hook lands here on a timer, so the detach waits for
+-- PLAYER_REGEN_ENABLED (9 Nov 2026).
+local detachPending = false
+
 local function DetachFromManager()
-	if type(tracker.BreakFromFrameManager) == "function" then
-		pcall(tracker.BreakFromFrameManager, tracker)
+	if type(tracker.BreakFromFrameManager) ~= "function" then return end
+	if InCombatLockdown() then
+		detachPending = true
+		return
 	end
+	detachPending = false
+	pcall(tracker.BreakFromFrameManager, tracker)
 end
 
 -- The modules and headers are a fixed 260 wide by template; the container's
@@ -1931,6 +1942,10 @@ QOP:SetScript("OnEvent", function(self, event, arg1)
 	elseif event == "BAG_UPDATE_COOLDOWN" then
 		UpdateItemCooldowns()
 	elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_REGEN_ENABLED" then
+		if event == "PLAYER_REGEN_ENABLED" and detachPending then
+			detachPending = false
+			ApplySaved()
+		end
 		RequestReflow()
 		QOP.RequestXPUpdate()
 		if event == "PLAYER_REGEN_ENABLED" and itemsPending then QOP.RequestItemsUpdate() end
